@@ -1,11 +1,15 @@
 // checkout.js
-function processPayment(cardNumber, cvv) {
-  // BAD: Logging sensitive data
-  console.log("Processing card: " + cardNumber + " CVV: " + cvv);
+function processPayment(paymentToken) {
+  // SECURE: Using a token instead of raw card numbers
+  // SECURE: Reading API key from environment variables
+  const stripeKey = process.env.STRIPE_SECRET_KEY;
   
-  // BAD: Hardcoded API key
-  const stripeKey = "sk_live_123456789";
+  if (!stripeKey) {
+    throw new Error("Stripe configuration missing");
+  }
   
-  return true;
+  // Process payment securely...
+  return { success: true, redirect: '/success' };
 }
+
 
