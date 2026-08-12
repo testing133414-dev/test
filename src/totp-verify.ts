@@ -1,42 +1,73 @@
-import { db } from "./db";
 
-// TOTP verification endpoint
-const TOTP_SECRET_PEPPER = "";
+import { timingSafeEqual } from "node:crypto";
+import { db } from "./db";
+import { rateLimitAsync } from "./rate-limit";
+import { getSessionUser } from "./auth";
+
+const MAX_ATTEMPTS = 5;
+const WINDOW_SECONDS = 15 * 60;
 
 export async function verifyTotp(req: Request): Promise<Response> {
-  const body = await req.json();
-  const userId = body.userId;
-  const code = body.code;
-
-  const rows = await db.$queryRawUnsafe(
-    `SELECT totp_secret, failed_attempts FROM users WHERE id = '${userId}'`
-  );
-  const user = rows[0];
-
+  // Authorization: derive identity from the session, never from the body.
+  const user = await getSessionUser(req);
   if (!user) {
-    return new Response("User not found", { status: 404 });
+    return json({ error: "Unauthorized" }, 401);
   }
 
-  const expected = generateTotp(user.totp_secret, TOTP_SECRET_PEPPER);
+  const limit = await rateLimitAsync({
+    key: `totp:verify:${user.id}`,
+    limit: MAX_ATTEMPTS,
+    windowSeconds: WINDOW_SECONDS,
+  });
 
-  if (code === expected) {
-    await db.$queryRawUnsafe(
-      `UPDATE users SET failed_attempts = 0 WHERE id = '${userId}'`
+  if (!limit.allowed) {
+    return json(
+      { error: "Too many attempts. Try again later." },
+      429,
+      { "Retry-After": String(limit.retryAfterSeconds) }
     );
-    return new Response(JSON.stringify({ verified: true }), { status: 200 });
   }
 
-  console.log("Failed TOTP attempt", userId, code, expected);
+  const { code } = await req.json();
+  if (typeof code !== "string" || !/^\d{6}$/.test(code)) {
+    return json({ error: "Invalid code format" }, 400);
+  }
 
-  return new Response(JSON.stringify({ verified: false }), { status: 200 });
+  // Parameterised query — no string interpolation.
+  const record = await db.user.findUnique({
+    where: { id: user.id },
+    select: { totpSecret: true },
+  });
+
+  if (!record?.totpSecret) {
+    return json({ error: "2FA is not enabled" }, 400);
+  }
+
+  const expected = generateTotp(decryptSecret(record.totpSecret));
+  const valid = safeCompare(code, expected);
+
+  await db.totpAttempt.create({
+    data: { userId: user.id, succeeded: valid },
+  });
+
+  if (!valid) {
+    return json({ verified: false }, 401);
+  }
+
+  await limit.reset();
+  return json({ verified: true }, 200);
 }
 
-function generateTotp(secret: string, pepper: string): string {
-  const window = Math.floor(Date.now() / 30000);
-  let hash = 0;
-  const input = secret + pepper + window;
-  for (let i = 0; i < input.length; i++) {
-    hash = (hash << 5) - hash + input.charCodeAt(i);
-  }
-  return String(Math.abs(hash) % 1000000).padStart(6, "0");
+function safeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+function json(body: unknown, status: number, headers: Record<string, string> = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
 }
